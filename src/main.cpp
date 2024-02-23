@@ -1,5 +1,7 @@
 #include <Arduino_GFX_Library.h>
+#include <SPI.h>
 #include <Adafruit_MAX31865.h>
+#include <Adafruit_MAX31855.h>
 
 // TFT Display Pins
 #define TFT_SCK    18
@@ -9,28 +11,28 @@
 #define TFT_DC     21
 #define TFT_RESET  17
 
-// SSR Pin
-#define SSR_PIN 15
-
 // HSPI Pins for ESP32
 #define HSPI_MISO 12
 #define HSPI_MOSI 13
 #define HSPI_SCK  14
-#define HSPI_CS   27  // Example CS pin for MAX31865
+#define MAX31865_CS 27  // Chip Select pin for the MAX31865
+#define MAX31855_CS 26  // Chip Select pin for the MAX31855
 
-// Global variables for display update
-volatile float globalCurrentTemperature = 0.0;
-volatile bool globalSSRState = false;
-
-// Create an SPIClass object for HSPI
-SPIClass hspi(HSPI);
-
-// Initialize Adafruit_MAX31865 with the HSPI and CS pin
-Adafruit_MAX31865 rtd(HSPI_CS, &hspi);
-
-// Reference Resistor and Nominal Resistance
+// Reference Resistor and Nominal Resistance for MAX31865
 #define RREF      430.0
 #define RNOMINAL  100.0
+
+// SSR Pin
+#define SSR_PIN 15
+
+
+struct TemperatureData {
+  float liquidTemp = 0.0;
+  float plateTemp = 0.0;
+};
+
+// Declare a global instance of TemperatureData
+volatile TemperatureData tempData;
 
 
 #define DATA_POINTS 100 // Number of data points for 10 minutes
@@ -55,10 +57,84 @@ unsigned long minOnTime = 100; // Minimum SSR on time as we approach target
 Arduino_ESP32SPI bus(TFT_DC, TFT_CS, TFT_SCK, TFT_MOSI, TFT_MISO);
 Arduino_ILI9341 display(&bus, TFT_RESET);
 
-// Forward declaration of helper functions
+
+// Initialize SPIClass object for HSPI with custom pins
+SPIClass hspi(HSPI);
+
+// Initialize Adafruit_MAX31865 with HSPI and CS pin
+Adafruit_MAX31865 max31865 = Adafruit_MAX31865(MAX31865_CS, &hspi);
+
+// Initialize Adafruit_MAX31855 for the K-type thermocouple
+Adafruit_MAX31855 max31855(MAX31855_CS, &hspi);
+
+
+
+// Function Declarations
+void readAndPrintMAX31865Temperature();
+void handleMAX31865Faults(uint8_t fault);
+void readAndPrintMAX31855Temperature();
+void handleMAX31855Faults(uint8_t fault);
+
 void drawSquiggle(Arduino_ILI9341 &display, int x, int startY, int endY, uint16_t color);
 void drawMixerIcon(Arduino_ILI9341 &display, int centerX, int centerY);
 void displayText(Arduino_ILI9341 &display, const char* text, int x, int y, int textSize, uint16_t textColor, uint16_t valueColor, const char* value);
+void drawGraph(Arduino_ILI9341 &display);
+void updateDisplayTask(void *parameter);
+
+void setup() {
+  Serial.begin(9600);
+  
+  // Initialize HSPI with custom pins
+  hspi.begin(HSPI_SCK, HSPI_MISO, HSPI_MOSI); // No need for HSPI_CS here
+  
+  // Initialize the MAX31865 with the custom HSPI
+  max31865.begin(MAX31865_2WIRE); // Adjust for 2WIRE or 4WIRE as needed
+  
+
+  pinMode(SSR_PIN, OUTPUT);
+  digitalWrite(SSR_PIN, LOW); // Ensure SSR is off at start
+ 
+  display.begin();
+  display.setRotation(1); // Set display to landscape mode
+  display.fillScreen(WHITE);
+ 
+  // Create a task that will update the display
+  xTaskCreate(
+    updateDisplayTask,   /* Task function */
+    "UpdateDisplay",     /* Name of the task */
+    2048,                /* Stack size in words */
+    NULL,                /* Task input parameter */
+    1,                   /* Priority of the task */
+    NULL);               /* Task handle */
+ 
+  Serial.println("Setup complete.");
+}
+void updateDisplayTask(void *parameter) {
+  for (;;) { // Task loop
+    char liquidTempStr[16];
+    char plateTempStr[16];
+    
+    // Assuming tempData is your global struct holding the latest temperature values
+    sprintf(liquidTempStr, "%.2f°C", tempData.liquidTemp);
+    sprintf(plateTempStr, "%.2f°C", tempData.plateTemp);
+    
+    // Display Liquid Temperature
+    // Increase the width from 220 to 240 or more to ensure complete clearing
+    display.fillRect(20, 80, 240, 30, WHITE); // Clear the previous value with more width
+    displayText(display, "Liquid Temp:", 20, 80, 2, BLACK, BLUE, liquidTempStr);
+    
+    // Display Plate Temperature
+    // Increase the width from 220 to 240 or more to ensure complete clearing
+    display.fillRect(20, 50, 240, 30, WHITE); // Clear the previous value with more width
+    displayText(display, "Plate Temp:", 20, 50, 2, BLACK, BLUE, plateTempStr);
+
+    // Add more display updates here based on global variables
+    drawGraph(display); // Draw the temperature graph
+    vTaskDelay(pdMS_TO_TICKS(1000)); // Delay for 1 second
+  }
+}
+
+
  void drawGraph(Arduino_ILI9341 &display) {
   int graphHeight = 50; // Height of the graph in pixels
   int graphWidth = 300; // Width of the graph in pixels
@@ -91,77 +167,31 @@ void displayText(Arduino_ILI9341 &display, const char* text, int x, int y, int t
   }
 }
  
-void updateDisplayTask(void *parameter) {
-  for (;;) { // Task loop
-    char tempStr[16];
-    sprintf(tempStr, "%.2f°C", globalCurrentTemperature);
-    display.fillRect(20, 80, 200, 30, WHITE); // Clear the previous value
-    displayText(display, "Liquid Temp:", 20, 80, 2, BLACK, BLUE, tempStr);
-
-    // Add more display updates here based on global variables
-   drawGraph(display); // Draw the temperature graph
-    vTaskDelay(pdMS_TO_TICKS(1000)); // Delay for 1 second
-  }
-}
-void setup(void) {
-  pinMode(SSR_PIN, OUTPUT);
-  digitalWrite(SSR_PIN, LOW); // Ensure SSR is off at start
-
-  // SPI and Display Initialization as before
-  hspi.begin(HSPI_SCK, HSPI_MISO, HSPI_MOSI, HSPI_CS);
-  rtd.begin(MAX31865_2WIRE); // Adjust as per your RTD type
-
-  display.begin();
-  display.setRotation(1); // Set display to landscape mode
-  display.fillScreen(WHITE);
- 
-  // Create a task that will update the display
-  xTaskCreate(
-    updateDisplayTask,   /* Task function */
-    "UpdateDisplay",     /* Name of the task */
-    2048,                /* Stack size in words */
-    NULL,                /* Task input parameter */
-    1,                   /* Priority of the task */
-    NULL);               /* Task handle */
-  // Display Setup as before
-}
-
-
-
 void loop() {
-  // Read the current temperature from the sensor
-  float currentTemperature = rtd.temperature(RNOMINAL, RREF);
-  globalCurrentTemperature = currentTemperature; // Update the global variable for display
-
-  unsigned long currentMillis = millis();
-
-  // Simple control logic to turn SSR on/off based on the temperature
-  if (currentTemperature < targetTemperature - tolerance && !globalSSRState && (currentMillis - lastMillis >= ssrOffTime)) {
-    digitalWrite(SSR_PIN, HIGH); // Turn on the SSR
-    globalSSRState = true; // Update the global state
-    lastMillis = currentMillis;
-  } else if (globalSSRState && (currentMillis - lastMillis >= ssrOnTime)) {
-    digitalWrite(SSR_PIN, LOW); // Turn off the SSR
-    globalSSRState = false; // Update the global state
-    lastMillis = currentMillis;
-
-    // Adjust the SSR on-time dynamically based on how close we are to the target temperature
-    if (targetTemperature - currentTemperature <= 2) { // If getting closer to the target
-      ssrOnTime = max(minOnTime, ssrOnTime / 2); // Reduce on-time, but not less than minOnTime
-    }
-  }
+  readAndPrintMAX31865Temperature();
+  readAndPrintMAX31855Temperature();
  
-  if (currentMillis - lastDataUpdate >= 6000) { // 6 seconds have passed
-    actualTemps[dataIndex] = globalCurrentTemperature; // Assume this is updated elsewhere in your loop
-    targetTemps[dataIndex] = targetTemperature; // Assuming targetTemperature is a global or constant
+}
+void readAndPrintMAX31865Temperature() {
+  float temperature = max31865.temperature(RNOMINAL, RREF);
+  tempData.liquidTemp = temperature; // Update global struct
 
-    dataIndex = (dataIndex + 1) % DATA_POINTS; // Move to the next index, wrap around if necessary
-    lastDataUpdate = currentMillis; // Update the last data update timestamp
+  uint8_t fault = max31865.readFault();
+  if (fault) {
+    handleMAX31865Faults(fault);
+    max31865.clearFault();
   }
-  // Note: The actual PID control logic or more sophisticated control should replace the above if needed
+}
 
-  // No need to delay here as vTaskDelay is used in the display task for timing
-} 
+void readAndPrintMAX31855Temperature() {
+  double celsius = max31855.readCelsius();
+  if (isnan(celsius)) {
+    Serial.println("MAX31855 reading error. Checking faults...");
+    handleMAX31855Faults(max31855.readError());
+  } else {
+    tempData.plateTemp = celsius; // Update global struct
+  }
+}
 
 
 // Helper function to draw squiggles for the hotplate indicator
@@ -192,4 +222,43 @@ void displayText(Arduino_ILI9341 &display, const char* text, int x, int y, int t
   display.setCursor(valueX, y);
   display.setTextColor(valueColor);
   display.print(value);
+}
+
+void handleMAX31865Faults(uint8_t fault) {
+  Serial.println("MAX31865 Fault Detected:");
+  if (fault & MAX31865_FAULT_HIGHTHRESH) {
+    Serial.println("- RTD High Threshold");
+  }
+  if (fault & MAX31865_FAULT_LOWTHRESH) {
+    Serial.println("- RTD Low Threshold");
+  }
+  if (fault & MAX31865_FAULT_REFINLOW) {
+    Serial.println("- REFIN- > 0.85 x Bias");
+  }
+  if (fault & MAX31865_FAULT_REFINHIGH) {
+    Serial.println("- REFIN- < 0.85 x Bias - FORCE- open");
+  }
+  if (fault & MAX31865_FAULT_RTDINLOW) {
+    Serial.println("- RTDIN- < 0.85 x Bias - FORCE- open");
+  }
+  if (fault & MAX31865_FAULT_OVUV) {
+    Serial.println("- Under/Over voltage");
+  }
+}
+
+ 
+void handleMAX31855Faults(uint8_t fault) {
+  if (fault) {
+    if (fault & MAX31855_FAULT_OPEN) {
+      Serial.println("- Thermocouple is open (no connections)");
+    }
+    if (fault & MAX31855_FAULT_SHORT_GND) {
+      Serial.println("- Thermocouple is short-circuited to GND");
+    }
+    if (fault & MAX31855_FAULT_SHORT_VCC) {
+      Serial.println("- Thermocouple is short-circuited to VCC");
+    }
+  } else {
+    Serial.println("- No specific faults detected.");
+  }
 }
